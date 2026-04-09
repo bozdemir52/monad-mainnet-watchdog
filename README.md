@@ -48,7 +48,7 @@ Monad Watchdog is actively evolving! Here are the upcoming features we plan to i
 Download the script to your server:
 ```bash
 git clone https://github.com/bozdemir52/monad-mainnet-watchdog.git
-cd monad-node-watchdog
+cd monad-mainnet-watchdog
 ```
 2. Install Requirements
 Install the necessary Python libraries (requests for API calls, psutil for hardware monitoring):
