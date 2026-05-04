@@ -12,18 +12,22 @@ TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
 DISCORD_WEBHOOK_URL = ""  # Paste your Discord Webhook URL here (Leave empty if not using)
 WATCHDOG_SERVER_IP = ""   # IP and port of your external Heartbeat server (e.g., "http://192.168.1.100:5000") (Leave empty if not using)
-NODE_RPC_URL = "http://localhost:8080" 
+NODE_RPC_URL = "http://localhost:8080"
 VALIDATOR_MONIKER = "YOUR_VAL_MONIKER_NAME"
 
-# --- HUGINN API TRACKING ---
+# --- MAINNET API TRACKING ---
 VALIDATOR_ADDRESS = "YOUR_SECP_ADDRESS"
 HUGINN_BASE_URL = "https://validator-api.huginn.tech/monad-api"
 
-# Alert Thresholds
+# --- ALERT THRESHOLDS ---
 ALERT_CPU_THRESHOLD = 90
 ALERT_DISK_THRESHOLD = 90
 ALERT_RAM_THRESHOLD = 90
 ALERT_TIMEOUT_THRESHOLD = 5
+ALERT_TPS_THRESHOLD = 4500
+ALERT_GAS_SEC_THRESHOLD = 300_000_000  
+ALERT_BASE_FEE_THRESHOLD = 150  
+STAKE_THRESHOLD = 10_000  # Adjust this for Mainnet active/standby logic
 # ------------------------
 
 CHECK_INTERVAL = 2  
@@ -71,48 +75,120 @@ def send_message(chat_id, text):
 def send_alert(text):
     send_message(TELEGRAM_CHAT_ID, text)
 
+# --- NVME WEAR & TEMPERATURE FETCHING ---
+def get_nvme_stats():
+    nvme_lines = []
+    try:
+        ls_output = subprocess.check_output(['ls', '/dev/'], text=True)
+        drives = [d for d in ls_output.split('\n') if re.match(r'^nvme\d+n\d+$', d)]
+        
+        for drive in drives:
+            try:
+                # Sudo is omitted in the command, bot must be run as root!
+                cmd = f"nvme smart-log /dev/{drive}"
+                output = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+                
+                wear = None
+                temp = None
+                
+                # Flexible regex matching for wear and temp
+                wear_match = re.search(r'percentage_used\s*:\s*(\d+)', output, re.IGNORECASE)
+                temp_match = re.search(r'temperature\s*:\s*(\d+)', output, re.IGNORECASE)
+                
+                if wear_match and temp_match:
+                    wear = int(wear_match.group(1))
+                    temp = int(temp_match.group(1))
+                    
+                    # Set emoji based on drive wear percentage
+                    emoji = "🟢" if wear < 75 else ("🟡" if wear < 100 else "🔴")
+                    nvme_lines.append(f"{emoji} *NVMe {drive}:* Wear `{wear}%` | Temp `{temp}°C`")
+            except Exception:
+                # Skip if drive cannot be accessed
+                continue
+    except Exception:
+        pass
+        
+    return "\n".join(nvme_lines) if nvme_lines else ""
+
+# General CPU Temperature (Fallback)
+def get_temperature():
+    try:
+        if hasattr(psutil, "sensors_temperatures"):
+            temps = psutil.sensors_temperatures()
+            if not temps: return "N/A"
+            for name, entries in temps.items():
+                for entry in entries:
+                    if entry.current:
+                        return f"{entry.current}°C"
+    except Exception:
+        pass
+    return "N/A"
+
 # --- HUGINN EXPLORER API DATA ---
+def get_epoch_details():
+    try:
+        epoch_url = f"{HUGINN_BASE_URL}/staking/epoch"
+        response = requests.get(epoch_url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            
+            if data.get("success") and "epoch" in data:
+                # API returns epoch as an integer
+                current_epoch = data["epoch"]
+                return current_epoch, "N/A", "N/A"
+                
+    except Exception as e:
+        print(f"⚠️ [API ERROR] Epoch Fetch Failed: {e}")
+    return "N/A", "N/A", "N/A"
+
 def get_validator_api_details():
     try:
-        # 1. Adım: Cüzdan adresinden Validator ID ve Uptime bilgisini çek
+        # Step 1: Fetch Validator ID and Uptime from wallet address
         uptime_url = f"{HUGINN_BASE_URL}/validator/uptime/{VALIDATOR_ADDRESS}"
         uptime_response = requests.get(uptime_url, timeout=10)
         uptime_data = uptime_response.json()
 
-        # Uptime datası bazen 'uptime' objesi içinde dönüyor
+        # Uptime data is sometimes nested inside an 'uptime' object
         val_info = uptime_data.get("uptime", uptime_data)
         val_id = val_info.get("validator_id")
 
-        # Uptime hesaplama
+        # Uptime calculations
         total_events = val_info.get("total_events", 0)
         finalized = val_info.get("finalized_count", 0)
+        timeout_count = val_info.get("timeout_count", 0)
         uptime_pct = (finalized / total_events * 100) if total_events > 0 else 0.0
 
         stake = 0.0
         rewards = 0.0
+        is_jailed = False
+        val_status = "unknown"
 
-        # 2. Adım: Bulunan ID ile Stake ve Ödül verilerini çek
+        # Step 2: Fetch Stake and Reward data using the retrieved ID
         if val_id:
             stake_url = f"{HUGINN_BASE_URL}/staking/validator/{val_id}"
             stake_response = requests.get(stake_url, timeout=10)
             if stake_response.status_code == 200:
                 stake_data = stake_response.json()
                 
-                # YENİ JSON YAPISINA GÖRE DÜZELTİLDİ: "validator" objesinin içine giriyoruz
+                # Enter the "validator" object
                 if stake_data.get("success") and "validator" in stake_data:
                     v_data = stake_data["validator"]
                     stake = float(v_data.get("stake", 0))
                     rewards = float(v_data.get("unclaimed_rewards", 0))
+                    is_jailed = v_data.get("jailed", False)
+                    val_status = v_data.get("status", "unknown")
 
         return {
             "val_id": val_id,
             "stake": stake,
             "rewards": rewards,
-            "uptime_pct": uptime_pct
+            "uptime_pct": uptime_pct,
+            "timeout_count": timeout_count,
+            "is_jailed": is_jailed,
+            "status": val_status
         }
-
     except Exception as e:
-        print(f"[API ERROR] Huginn Fetch Failed: {e}")
+        print(f"⚠️ [API ERROR] Huginn Fetch Failed: {e}")
         return None
 # ---------------------------------------------
 
@@ -123,12 +199,20 @@ def get_eth_block_details():
         response.raise_for_status()
         data = response.json()
         if "result" in data and data["result"]:
-            height = int(data["result"]["number"], 16)
-            tx_count = len(data["result"]["transactions"])
-            return height, tx_count
-        return None, 0
+            block = data["result"]
+            height = int(block["number"], 16)
+            
+            tx_in_block = len(block["transactions"])
+            estimated_tps = int(tx_in_block * 2.5) 
+            
+            gas_used = int(block.get("gasUsed", "0x0"), 16)
+            base_fee = int(block.get("baseFeePerGas", "0x0"), 16) / 10**9 
+            gas_per_sec = int(gas_used * 2.5)
+            
+            return height, estimated_tps, gas_per_sec, base_fee
+        return None, 0, 0, 0.0
     except Exception:
-        return None, 0
+        return None, 0, 0, 0.0
 
 def get_system_health():
     global last_io_counters, last_io_time
@@ -152,7 +236,10 @@ def get_system_health():
     last_io_time = current_time
     disk_io_str = f"{read_speed_mb:.2f} MB/s Read | {write_speed_mb:.2f} MB/s Write"
     
-    return cpu, ram, disk_percent, disk_str, disk_io_str
+    temp_str = get_temperature() 
+    nvme_str = get_nvme_stats() 
+    
+    return cpu, ram, disk_percent, disk_str, disk_io_str, temp_str, nvme_str
 
 def get_monad_status_details():
     details = {"triedb_percent": None, "triedb_str": "N/A", "sync_status": "Unknown", "epoch": "N/A", "round": "N/A"}
@@ -169,7 +256,6 @@ def get_monad_status_details():
             
             if in_consensus:
                 if 'status:' in line: details["sync_status"] = line.split('status:')[1].strip()
-                elif 'epoch:' in line: details["epoch"] = line.split('epoch:')[1].strip()
                 elif 'round:' in line: details["round"] = line.split('round:')[1].strip()
             
             if 'capacity:' in line: capacity_str = line.split('capacity:')[1].strip()
@@ -187,30 +273,40 @@ def get_monad_status_details():
     except Exception:
         return details
 
-def create_status_message(local_height, tps, cpu, ram, disk_str, disk_io_str, monad_details, val_data):
+def create_status_message(local_height, tps, gas_sec, base_fee, cpu, ram, disk_str, disk_io_str, temp_str, nvme_str, monad_details, val_data):
     if local_height is None:
         return "🚨 *ERROR:* Cannot reach the local Node RPC!"
     
     uptime = get_uptime()
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    api_epoch, epoch_prog, blocks_left = get_epoch_details()
     
-    val_status = "✅ `Active / Signing`"
-    if missed_block_counter > 0:
-        val_status = f"⚠️ `Missing Blocks! ({missed_block_counter})`"
+    # Active/Inactive/Jailed Status Logic
+    if val_data and val_data.get('is_jailed'):
+        val_status = "🛑 `JAILED (Slashed!)`"
+    elif val_data and 'stake' in val_data:
+        if val_data['stake'] < STAKE_THRESHOLD:
+            val_status = "💤 `Inactive / Standby`"
+        elif missed_block_counter > 0:
+            val_status = f"⚠️ `Missing Blocks! ({missed_block_counter})`"
+        else:
+            val_status = "✅ `Active / Signing`"
+    else:
+        val_status = "✅ `Active / Signing`"
+        if missed_block_counter > 0:
+            val_status = f"⚠️ `Missing Blocks! ({missed_block_counter})`"
         
     triedb_str = monad_details.get("triedb_str", "N/A")
     sync_status = monad_details.get("sync_status", "Unknown")
-    epoch = monad_details.get("epoch", "N/A")
     rnd = monad_details.get("round", "N/A")
-    
     sync_emoji = "🟢" if sync_status == "in-sync" else "🟡"
 
-    # Validator Data
+    # Validator API Data Presentation
     if val_data and val_data.get('val_id') is not None:
         stake = val_data['stake']
         rewards = val_data['rewards']
         uptime_pct = val_data['uptime_pct']
-        
+        api_timeouts = val_data.get('timeout_count', 0)
         session_earned = rewards - initial_rewards if initial_rewards is not None else 0.0
         
         val_section = (
@@ -219,10 +315,16 @@ def create_status_message(local_height, tps, cpu, ram, disk_str, disk_io_str, mo
             f"💰 *Rewards:* `{rewards:,.2f} MON`\n"
             f"📈 *Session Earned:* `+{session_earned:,.4f} MON`\n"
             f"💎 *Stake:* `{stake:,.2f} MON`\n"
+            f"📉 *API Timeouts:* `{api_timeouts}` blocks\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
         )
     else:
-        val_section = "**🏆 Validator Stats**\n⚠️ *Huginn API Verisi Bekleniyor*\n━━━━━━━━━━━━━━━━━━━━━\n"
+        val_section = "**🏆 Validator Stats**\n⚠️ *Awaiting Huginn API Data*\n━━━━━━━━━━━━━━━━━━━━━\n"
+
+    gas_formatted = f"{gas_sec / 1_000_000:.1f}M" if gas_sec > 0 else "0"
+
+    # NVMe String inclusion
+    nvme_section = f"{nvme_str}\n" if nvme_str else ""
 
     msg = (
         f"🛡️ *{VALIDATOR_MONIKER} | MONAD WATCHDOG*\n"
@@ -231,13 +333,17 @@ def create_status_message(local_height, tps, cpu, ram, disk_str, disk_io_str, mo
         "**⛓️ Blockchain & Node**\n"
         f"🧱 *Local Block:* `{local_height}`\n"
         f"⚡ *Current TPS:* `{tps}`\n"
+        f"🔥 *Gas/Sec:* `{gas_formatted}` | 💸 *Base Fee:* `{base_fee:.2f} gwei`\n"
         f"🔄 *Sync Status:* {sync_emoji} `{sync_status}`\n"
-        f"🎯 *Epoch / Round:* `{epoch} / {rnd}`\n"
+        f"🎯 *Epoch:* `{api_epoch}` (`{epoch_prog}%` done, `{blocks_left}` left)\n"
+        f"🔁 *Round:* `{rnd}`\n"
         f"✍️ *Node Status:* {val_status}\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         + val_section +
         "**🖥️ Server Health**\n"
         f"🧠 *CPU:* `{cpu}%` | 💾 *RAM:* `{ram}%`\n"
+        f"🌡️ *Temp (Gen):* `{temp_str}`\n"
+        + nvme_section +
         f"💽 *OS Disk:* `{disk_str}`\n"
         f"⚙️ *Disk I/O:* `{disk_io_str}`\n"
         f"🗄️ *TrieDB:* `{triedb_str}`\n"
@@ -284,12 +390,12 @@ def check_updates():
                         send_message(chat_id, "👋 Hello! Type */status* for detailed metrics.")
                     elif text == "/status":
                         send_message(chat_id, "🔄 Fetching dashboard...")
-                        local_height, tps = get_eth_block_details()
-                        cpu, ram, disk_percent, disk_str, disk_io_str = get_system_health()
+                        local_height, tps, gas_sec, base_fee = get_eth_block_details()
+                        cpu, ram, disk_percent, disk_str, disk_io_str, temp_str, nvme_str = get_system_health()
                         monad_details = get_monad_status_details()
                         val_data = get_validator_api_details()
                         
-                        msg = create_status_message(local_height, tps, cpu, ram, disk_str, disk_io_str, monad_details, val_data)
+                        msg = create_status_message(local_height, tps, gas_sec, base_fee, cpu, ram, disk_str, disk_io_str, temp_str, nvme_str, monad_details, val_data)
                         send_message(chat_id, msg)
     except Exception:
         pass
@@ -298,7 +404,8 @@ def main():
     global missed_block_counter, initial_rewards
     
     print("🚀 [INFO] Monad Ultimate Validator Watchdog started...")
-    # Başlangıç ödülünü kaydet
+    
+    # Save initial rewards for session tracking
     init_data = get_validator_api_details()
     if init_data and init_data.get('rewards'):
         initial_rewards = init_data["rewards"]
@@ -310,17 +417,27 @@ def main():
     stuck_counter = 0
     last_report_time = time.time()
     last_hardware_alert_time = 0 
+    last_tps_alert_time = 0 
+    last_gas_alert_time = 0
+    last_fee_alert_time = 0
     
     while True:
         check_updates()
-        current_height, current_tps = get_eth_block_details()
-        cpu, ram, disk_percent, disk_str, disk_io_str = get_system_health()
+                
+        current_height, current_tps, current_gas_sec, current_base_fee = get_eth_block_details()
+        cpu, ram, disk_percent, disk_str, disk_io_str, temp_str, nvme_str = get_system_health()
         monad_details = get_monad_status_details()
         triedb_percent = monad_details.get("triedb_percent")
+        val_api_data = get_validator_api_details()
         
+        # JAILED ALERT
+        if val_api_data and val_api_data.get("is_jailed"):
+            send_alert("🚨 *CRITICAL ALERT* 🚨\n\nYour validator has been **JAILED (Slashed)**! Immediate action required!")
+            time.sleep(60) 
+
         # TIMEOUT ALERTS
         if missed_block_counter >= ALERT_TIMEOUT_THRESHOLD:
-            send_alert(f"🚨 **VALIDATOR ALERT** 🚨\nMissed `{missed_block_counter}` consecutive blocks!")
+            send_alert(f"🚨 **VALIDATOR ALERT** 🚨\nMissed `{missed_block_counter}` consecutive blocks locally!")
             missed_block_counter = 0  
             time.sleep(10) 
 
@@ -332,10 +449,30 @@ def main():
             if disk_percent > ALERT_DISK_THRESHOLD: alert_msg += f"🆘 *OS DISK:* `{disk_percent}%`\n"
             if triedb_percent is not None and triedb_percent > ALERT_DISK_THRESHOLD: 
                 alert_msg += f"🗄️🆘 *TRIEDB:* `{triedb_percent}%`\n"
-                
+            
+            # Watchdog alert for NVMe critical wear
+            if "🔴" in nvme_str:
+                 alert_msg += f"🔥 **NVME WEAR CRITICAL!** A disk has exceeded 100% wear! Ticking Time Bomb! 💣\n"
+                 
             if alert_msg:
                 send_alert(f"🚨 **SYSTEM RESOURCE WARNING** 🚨\n\n{alert_msg}")
                 last_hardware_alert_time = time.time()
+
+        # GAS / HEAVY EXECUTION ALERTS
+        if current_gas_sec >= ALERT_GAS_SEC_THRESHOLD and time.time() - last_gas_alert_time > 300:
+            send_alert(f"🔥 **HEAVY EXECUTION ALERT** 🔥\nNetwork burning `{current_gas_sec / 1_000_000:.1f}M` Gas/sec!")
+            last_gas_alert_time = time.time()
+    
+        # BASE FEE ALERTS
+        if current_base_fee >= ALERT_BASE_FEE_THRESHOLD and time.time() - last_fee_alert_time > 300:
+            send_alert(f"💸 **BASE FEE SPIKE DETECTED** 💸\nFees skyrocketed to `{current_base_fee:.2f} gwei`!")
+            last_fee_alert_time = time.time()
+
+        # HIGH TPS ALERTS
+        if current_tps >= ALERT_TPS_THRESHOLD:
+            if time.time() - last_tps_alert_time > 300:
+                send_alert(f"🚀 **HIGH TPS ALERT** 🚀\nNetwork reached estimated `{current_tps}` TPS!")
+                last_tps_alert_time = time.time()
 
         if current_height is not None:
             if current_height != last_height:
@@ -347,9 +484,9 @@ def main():
                 send_alert(f"🛑 *ALERT: Node STUCK!*\nBlock: `{current_height}`\nNo new blocks for 3 minutes!")
                 stuck_counter = 0 
 
+            # AUTOMATIC HOURLY REPORT
             if time.time() - last_report_time > AUTO_REPORT_INTERVAL:
-                val_data = get_validator_api_details()
-                msg = create_status_message(current_height, current_tps, cpu, ram, disk_str, disk_io_str, monad_details, val_data)
+                msg = create_status_message(current_height, current_tps, current_gas_sec, current_base_fee, cpu, ram, disk_str, disk_io_str, temp_str, nvme_str, monad_details, val_api_data)
                 send_message(TELEGRAM_CHAT_ID, "⏰ *AUTOMATIC REPORT*\n\n" + msg)
                 last_report_time = time.time()
             
